@@ -1,0 +1,5 @@
+{
+  "name": "Dashboard Banco de Horas",
+  "description": "Sistema interativo para análise e controle de banco de horas de colaboradores com base em espelhos de ponto.",
+  "requestFramePermissions": []
+}
