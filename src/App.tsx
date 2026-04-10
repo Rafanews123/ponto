@@ -1,4 +1,4 @@
-import { useState, useMemo, ReactNode } from "react";
+import React, { useState, useMemo, ReactNode, useRef } from "react";
 import { 
   Search, 
   TrendingUp, 
@@ -11,10 +11,12 @@ import {
   Clock,
   AlertCircle,
   Copy,
-  Check
+  Check,
+  FileUp,
+  Loader2
 } from "lucide-react";
 import { 
-  employeeData, 
+  employeeData as initialEmployeeData, 
   timeToMinutes, 
   minutesToTime, 
   EmployeeTimeData,
@@ -54,8 +56,10 @@ import {
 } from "recharts";
 import { motion, AnimatePresence } from "motion/react";
 import * as XLSX from "xlsx";
+import { GoogleGenAI, Type } from "@google/genai";
 
 export default function App() {
+  const [employees, setEmployees] = useState<EmployeeTimeData[]>(initialEmployeeData);
   const [searchTerm, setSearchTerm] = useState("");
   const [filterType, setFilterType] = useState<"all" | "positive" | "negative">("all");
   const [sortConfig, setSortConfig] = useState<{ key: keyof EmployeeTimeData; direction: "asc" | "desc" }>({
@@ -63,10 +67,12 @@ export default function App() {
     direction: "asc",
   });
   const [copied, setCopied] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Calculations
   const filteredAndSortedData = useMemo(() => {
-    let result = [...employeeData];
+    let result = [...employees];
 
     // Search
     if (searchTerm) {
@@ -100,31 +106,31 @@ export default function App() {
     });
 
     return result;
-  }, [searchTerm, filterType, sortConfig]);
+  }, [employees, searchTerm, filterType, sortConfig]);
 
   const stats = useMemo(() => {
-    const totalPos = employeeData.reduce((acc, emp) => {
+    const totalPos = employees.reduce((acc, emp) => {
       const pos = timeToMinutes(emp.positiveHours);
       return acc + (pos > 0 ? pos : 0);
     }, 0);
 
-    const totalNeg = employeeData.reduce((acc, emp) => {
+    const totalNeg = employees.reduce((acc, emp) => {
       const neg = timeToMinutes(emp.negativeHours);
       return acc + (neg > 0 ? neg : 0);
     }, 0);
 
-    const netBalance = employeeData.reduce((acc, emp) => acc + timeToMinutes(emp.currentBalance), 0);
+    const netBalance = employees.reduce((acc, emp) => acc + timeToMinutes(emp.currentBalance), 0);
 
     return {
       totalPos: minutesToTime(totalPos, true),
       totalNeg: minutesToTime(totalNeg, true),
       netBalance: minutesToTime(netBalance, true),
-      totalEmployees: employeeData.length,
-      positiveCount: employeeData.filter(e => timeToMinutes(e.currentBalance) > 0).length,
-      negativeCount: employeeData.filter(e => timeToMinutes(e.currentBalance) < 0).length,
-      neutralCount: employeeData.filter(e => timeToMinutes(e.currentBalance) === 0).length,
+      totalEmployees: employees.length,
+      positiveCount: employees.filter(e => timeToMinutes(e.currentBalance) > 0).length,
+      negativeCount: employees.filter(e => timeToMinutes(e.currentBalance) < 0).length,
+      neutralCount: employees.filter(e => timeToMinutes(e.currentBalance) === 0).length,
     };
-  }, []);
+  }, [employees]);
 
   const chartData = useMemo(() => {
     return filteredAndSortedData.slice(0, 10).map(emp => ({
@@ -196,6 +202,61 @@ export default function App() {
     });
   };
 
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setIsProcessing(true);
+    try {
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        const base64Data = (e.target?.result as string).split(',')[1];
+        
+        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+        const response = await ai.models.generateContent({
+          model: "gemini-3-flash-preview",
+          contents: [
+            {
+              inlineData: {
+                mimeType: "application/pdf",
+                data: base64Data
+              }
+            },
+            {
+              text: "Extract the employee bank of hours data from this PDF. Return a JSON array of objects with the following keys: id, name, previousBalance, positiveHours, negativeHours, currentBalance. Ensure all time values are in HH:MM format (e.g., 10:30 or -0:15). If a value is negative, it must start with a minus sign."
+            }
+          ],
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  id: { type: Type.STRING },
+                  name: { type: Type.STRING },
+                  previousBalance: { type: Type.STRING },
+                  positiveHours: { type: Type.STRING },
+                  negativeHours: { type: Type.STRING },
+                  currentBalance: { type: Type.STRING }
+                },
+                required: ["id", "name", "previousBalance", "positiveHours", "negativeHours", "currentBalance"]
+              }
+            }
+          }
+        });
+
+        const newEmployees = JSON.parse(response.text);
+        setEmployees(newEmployees);
+        setIsProcessing(false);
+      };
+      reader.readAsDataURL(file);
+    } catch (error) {
+      console.error("Error processing PDF:", error);
+      setIsProcessing(false);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-slate-50/50 p-4 md:p-8 font-sans">
       <div className="max-w-7xl mx-auto space-y-8">
@@ -206,6 +267,22 @@ export default function App() {
             <p className="text-slate-500 mt-1">Análise consolidada do período: Março 2026</p>
           </div>
           <div className="flex items-center gap-3">
+            <input 
+              type="file" 
+              accept=".pdf" 
+              className="hidden" 
+              ref={fileInputRef}
+              onChange={handleFileUpload}
+            />
+            <Button 
+              variant="outline"
+              className="gap-2 border-slate-200 hover:bg-slate-100"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isProcessing}
+            >
+              {isProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileUp className="w-4 h-4" />}
+              {isProcessing ? "Processando..." : "Importar PDF"}
+            </Button>
             <Button 
               variant="outline" 
               className="gap-2 border-slate-200 hover:bg-slate-100"
