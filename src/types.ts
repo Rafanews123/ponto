@@ -18,6 +18,13 @@ export interface EmployeeTimeData {
   details?: DailyRecord[];
 }
 
+export interface MonthlyHistory {
+  id: string; // e.g. "2026-03"
+  monthName: string; // e.g. "Março de 2026"
+  data: EmployeeTimeData[];
+  createdAt: any;
+}
+
 export function timeToMinutes(timeStr: string): number {
   if (!timeStr) return 0;
   const isNegative = timeStr.startsWith('-') || timeStr.endsWith('-');

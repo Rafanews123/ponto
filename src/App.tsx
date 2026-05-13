@@ -27,7 +27,8 @@ import {
   minutesToTime, 
   EmployeeTimeData,
   formatTimeWithParens,
-  DailyRecord
+  DailyRecord,
+  MonthlyHistory
 } from "@/types";
 import { cn } from "@/lib/utils";
 import { 
@@ -126,6 +127,10 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
 
 export default function App() {
   const [employees, setEmployees] = useState<EmployeeTimeData[]>(initialEmployeeData);
+  const [preparedData, setPreparedData] = useState<EmployeeTimeData[] | null>(null);
+  const [historyRecords, setHistoryRecords] = useState<MonthlyHistory[]>([]);
+  const [viewMode, setViewMode] = useState<"current" | "history">("current");
+  const [selectedHistoryId, setSelectedHistoryId] = useState<string | null>(null);
   const [user, setUser] = useState<User | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [dbError, setDbError] = useState<string | null>(null);
@@ -174,14 +179,36 @@ export default function App() {
     };
   }, []);
 
+  // Fetch history records
+  useEffect(() => {
+    const historyQuery = query(collection(db, "monthly_history"));
+    const unsubscribeHistory = onSnapshot(historyQuery, (snapshot) => {
+      const records = snapshot.docs.map(doc => ({
+        ...doc.data(),
+        id: doc.id
+      })) as MonthlyHistory[];
+      setHistoryRecords(records.sort((a, b) => b.id.localeCompare(a.id)));
+    });
+
+    return () => unsubscribeHistory();
+  }, []);
+
+  const currentMonthData = useMemo(() => {
+    if (viewMode === "history" && selectedHistoryId) {
+      const record = historyRecords.find(r => r.id === selectedHistoryId);
+      return record ? record.data : [];
+    }
+    return employees;
+  }, [viewMode, selectedHistoryId, historyRecords, employees]);
+
   const selectedEmployee = useMemo(() => 
-    employees.find(e => e.id === selectedEmployeeId),
-    [employees, selectedEmployeeId]
+    currentMonthData.find(e => e.id === selectedEmployeeId),
+    [currentMonthData, selectedEmployeeId]
   );
 
   // Calculations
   const filteredAndSortedData = useMemo(() => {
-    let result = [...employees];
+    let result = [...currentMonthData];
 
     // Search
     if (searchTerm) {
@@ -215,31 +242,31 @@ export default function App() {
     });
 
     return result;
-  }, [employees, searchTerm, filterType, sortConfig]);
+  }, [currentMonthData, searchTerm, filterType, sortConfig]);
 
   const stats = useMemo(() => {
-    const totalPos = employees.reduce((acc, emp) => {
+    const totalPos = currentMonthData.reduce((acc, emp) => {
       const pos = timeToMinutes(emp.positiveHours);
       return acc + (pos > 0 ? pos : 0);
     }, 0);
 
-    const totalNeg = employees.reduce((acc, emp) => {
+    const totalNeg = currentMonthData.reduce((acc, emp) => {
       const neg = timeToMinutes(emp.negativeHours);
       return acc + (neg > 0 ? neg : 0);
     }, 0);
 
-    const netBalance = employees.reduce((acc, emp) => acc + timeToMinutes(emp.currentBalance), 0);
+    const netBalance = currentMonthData.reduce((acc, emp) => acc + timeToMinutes(emp.currentBalance), 0);
 
     return {
       totalPos: minutesToTime(totalPos, true),
       totalNeg: minutesToTime(totalNeg, true),
       netBalance: minutesToTime(netBalance, true),
-      totalEmployees: employees.length,
-      positiveCount: employees.filter(e => timeToMinutes(e.currentBalance) > 0).length,
-      negativeCount: employees.filter(e => timeToMinutes(e.currentBalance) < 0).length,
-      neutralCount: employees.filter(e => timeToMinutes(e.currentBalance) === 0).length,
+      totalEmployees: currentMonthData.length,
+      positiveCount: currentMonthData.filter(e => timeToMinutes(e.currentBalance) > 0).length,
+      negativeCount: currentMonthData.filter(e => timeToMinutes(e.currentBalance) < 0).length,
+      neutralCount: currentMonthData.filter(e => timeToMinutes(e.currentBalance) === 0).length,
     };
-  }, [employees]);
+  }, [currentMonthData]);
 
   const chartData = useMemo(() => {
     return filteredAndSortedData.slice(0, 10).map(emp => ({
@@ -388,31 +415,60 @@ export default function App() {
       }
 
       setEmployees(allNewEmployees);
+      setPreparedData(allNewEmployees);
       setSelectedEmployeeId(null); // Reset view
       setIsProcessing(false);
-
-      // Persist to Firestore
-      if (user) {
-        try {
-          const batch = writeBatch(db);
-          
-          // Delete old records first
-          const oldDocs = await getDocs(collection(db, "employees"));
-          oldDocs.forEach(d => batch.delete(d.ref));
-          
-          // Add new records
-          allNewEmployees.forEach(emp => {
-            const docRef = doc(db, "employees", emp.id);
-            batch.set(docRef, emp);
-          });
-
-          await batch.commit();
-        } catch (error) {
-          handleFirestoreError(error, OperationType.WRITE, "employees");
-        }
-      }
     } catch (error) {
       console.error("Error processing PDFs:", error);
+      setIsProcessing(false);
+    }
+  };
+
+  const handleSaveToCurrent = async () => {
+    if (!user || !preparedData) return;
+    try {
+      setIsProcessing(true);
+      const batch = writeBatch(db);
+      
+      // Delete old records first
+      const oldDocs = await getDocs(collection(db, "employees"));
+      oldDocs.forEach(d => batch.delete(d.ref));
+      
+      // Add new records
+      preparedData.forEach(emp => {
+        const docRef = doc(db, "employees", emp.id);
+        batch.set(docRef, emp);
+      });
+
+      await batch.commit();
+      setPreparedData(null);
+      setIsProcessing(false);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, "employees");
+      setIsProcessing(false);
+    }
+  };
+
+  const handleSaveToHistory = async (monthName: string) => {
+    if (!user || !preparedData) return;
+    try {
+      setIsProcessing(true);
+      // Generate ID from name or date
+      const monthId = new Date().toISOString().slice(0, 7); // Default to current month
+      
+      await setDoc(doc(db, "monthly_history", monthId), {
+        id: monthId,
+        monthName: monthName,
+        data: preparedData,
+        createdAt: new Date()
+      });
+
+      setPreparedData(null);
+      setIsProcessing(false);
+      setViewMode("history");
+      setSelectedHistoryId(monthId);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, "monthly_history");
       setIsProcessing(false);
     }
   };
@@ -441,13 +497,99 @@ export default function App() {
             </Button>
           </div>
         )}
+
+        {preparedData && user && (
+          <motion.div 
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="bg-primary/5 border border-primary/20 p-4 rounded-xl flex flex-col md:flex-row items-center justify-between gap-4"
+          >
+            <div className="flex items-center gap-3">
+              <div className="bg-primary/10 p-2 rounded-full">
+                <FileUp className="w-5 h-5 text-primary" />
+              </div>
+              <div>
+                <p className="font-bold text-slate-800">Novos dados carregados!</p>
+                <p className="text-xs text-slate-500">Deseja salvar estes dados no Dashboard Atual ou em um mês específico?</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button size="sm" onClick={handleSaveToCurrent} disabled={isProcessing}>
+                {isProcessing ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
+                Salvar no Atual
+              </Button>
+              <Select onValueChange={(val) => handleSaveToHistory(val)}>
+                <SelectTrigger className="w-[180px] bg-white h-9 text-xs">
+                  <History className="w-3 h-3 mr-2" />
+                  <SelectValue placeholder="Salvar no Histórico" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="Janeiro 2026">Janeiro 2026</SelectItem>
+                  <SelectItem value="Fevereiro 2026">Fevereiro 2026</SelectItem>
+                  <SelectItem value="Março 2026">Março 2026</SelectItem>
+                  <SelectItem value="Abril 2026">Abril 2026</SelectItem>
+                  <SelectItem value="Maio 2026">Maio 2026</SelectItem>
+                </SelectContent>
+              </Select>
+              <Button variant="ghost" size="sm" onClick={() => setPreparedData(null)} disabled={isProcessing}>
+                Descartar
+              </Button>
+            </div>
+          </motion.div>
+        )}
+
         {/* Header */}
         <header className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div>
-            <h1 className="text-3xl font-bold tracking-tight text-slate-900">Dashboard Banco de Horas</h1>
-            <p className="text-slate-500 mt-1">Análise consolidada do período: Março 2026</p>
+            <div className="flex items-center gap-3 mb-1">
+              <h1 className="text-3xl font-bold tracking-tight text-slate-900">Dashboard Banco de Horas</h1>
+              {viewMode === "history" && (
+                <Badge variant="secondary" className="bg-primary/10 text-primary border-none font-bold">
+                  MODO HISTÓRICO
+                </Badge>
+              )}
+            </div>
+            <p className="text-slate-500">
+              {viewMode === "current" 
+                ? "Visualizando dados do dashboard principal" 
+                : `Visualizando histórico de: ${historyRecords.find(r => r.id === selectedHistoryId)?.monthName}`}
+            </p>
           </div>
           <div className="flex items-center gap-3">
+            {/* Tabs */}
+            <div className="bg-slate-200/50 p-1 rounded-lg flex items-center mr-2">
+              <button
+                onClick={() => setViewMode("current")}
+                className={cn(
+                  "px-3 py-1.5 text-xs font-bold rounded-md transition-all",
+                  viewMode === "current" ? "bg-white text-primary shadow-sm" : "text-slate-500 hover:text-slate-700"
+                )}
+              >
+                Dashboard Atual
+              </button>
+              <Select 
+                value={selectedHistoryId || undefined} 
+                onValueChange={(val) => {
+                  setViewMode("history");
+                  setSelectedHistoryId(val);
+                }}
+              >
+                <SelectTrigger className={cn(
+                  "px-3 py-1.5 h-auto border-none bg-transparent text-xs font-bold shadow-none focus:ring-0",
+                  viewMode === "history" ? "bg-white text-primary shadow-sm rounded-md" : "text-slate-500"
+                )}>
+                  <SelectValue placeholder="Meses Anteriores" />
+                </SelectTrigger>
+                <SelectContent>
+                  {historyRecords.length === 0 && (
+                    <SelectItem value="none" disabled>Nenhum histórico salvo</SelectItem>
+                  )}
+                  {historyRecords.map(record => (
+                    <SelectItem key={record.id} value={record.id}>{record.monthName}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
             {user ? (
               <div className="flex items-center gap-3 mr-4 py-2 px-3 bg-white rounded-lg border border-slate-200 shadow-sm">
                 <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center text-primary">
