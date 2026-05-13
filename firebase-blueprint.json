@@ -1,0 +1,39 @@
+{
+  "entities": {
+    "Employee": {
+      "title": "Employee",
+      "description": "Calculated bank of hours data for a specific employee.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "previousBalance": { "type": "string" },
+        "positiveHours": { "type": "string" },
+        "negativeHours": { "type": "string" },
+        "currentBalance": { "type": "string" },
+        "details": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "date": { "type": "string" },
+              "weekday": { "type": "string" },
+              "entries": { "type": "string" },
+              "workedHours": { "type": "string" },
+              "extraHours": { "type": "string" },
+              "debtHours": { "type": "string" },
+              "balance": { "type": "string" }
+            }
+          }
+        }
+      },
+      "required": ["id", "name", "previousBalance", "positiveHours", "negativeHours", "currentBalance"]
+    }
+  },
+  "firestore": {
+    "/employees/{employeeId}": {
+      "schema": "Employee",
+      "description": "Collection of employee data for the current dashboard."
+    }
+  }
+}

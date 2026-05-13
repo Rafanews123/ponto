@@ -1,4 +1,4 @@
-import React, { useState, useMemo, ReactNode, useRef } from "react";
+import React, { useState, useMemo, ReactNode, useRef, useEffect } from "react";
 import { 
   Search, 
   TrendingUp, 
@@ -16,7 +16,10 @@ import {
   Loader2,
   ChevronLeft,
   CalendarDays,
-  History
+  History,
+  LogIn,
+  LogOut,
+  User as UserIcon
 } from "lucide-react";
 import { 
   employeeData as initialEmployeeData, 
@@ -61,9 +64,71 @@ import {
 import { motion, AnimatePresence } from "motion/react";
 import * as XLSX from "xlsx";
 import { GoogleGenAI, Type } from "@google/genai";
+import { db, auth, loginWithGoogle, logout } from "@/lib/firebase";
+import { onAuthStateChanged, User } from "firebase/auth";
+import { 
+  collection, 
+  getDocs, 
+  setDoc, 
+  doc, 
+  deleteDoc, 
+  writeBatch,
+  query,
+  onSnapshot
+} from "firebase/firestore";
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData?.map(provider => ({
+        providerId: provider.providerId,
+        email: provider.email,
+      })) || []
+    },
+    operationType,
+    path
+  }
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
 
 export default function App() {
   const [employees, setEmployees] = useState<EmployeeTimeData[]>(initialEmployeeData);
+  const [user, setUser] = useState<User | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [dbError, setDbError] = useState<string | null>(null);
   const [selectedEmployeeId, setSelectedEmployeeId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
   const [filterType, setFilterType] = useState<"all" | "positive" | "negative">("all");
@@ -75,6 +140,39 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [processingProgress, setProcessingProgress] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Sync with Firestore
+  useEffect(() => {
+    const unsubscribeAuth = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+    });
+
+    const q = query(collection(db, "employees"));
+    
+    // Initial fetch and real-time listener combined
+    const unsubscribeSnapshot = onSnapshot(q, (snapshot) => {
+      if (snapshot.empty) {
+        console.log("No employees found in Firestore, using default data.");
+      } else {
+        const data = snapshot.docs.map(doc => ({
+          ...doc.data(),
+          details: (doc.data() as any).details || []
+        })) as EmployeeTimeData[];
+        setEmployees(data);
+      }
+      setIsLoading(false);
+      setDbError(null);
+    }, (error) => {
+      console.error("Firestore sync error:", error);
+      setDbError("Erro de conexão com o servidor. Verifique sua permissão.");
+      setIsLoading(false);
+    });
+
+    return () => {
+      unsubscribeAuth();
+      unsubscribeSnapshot();
+    };
+  }, []);
 
   const selectedEmployee = useMemo(() => 
     employees.find(e => e.id === selectedEmployeeId),
@@ -223,7 +321,7 @@ export default function App() {
     
     try {
       const allNewEmployees: EmployeeTimeData[] = [];
-      const fileList = Array.from(files);
+      const fileList = Array.from(files) as File[];
       
       for (let i = 0; i < fileList.length; i++) {
         const file = fileList[i];
@@ -283,7 +381,7 @@ export default function App() {
 
           const extractedData = JSON.parse(response.text) as EmployeeTimeData;
           allNewEmployees.push(extractedData);
-        } catch (fileErr) {
+        } catch (fileErr: any) {
           console.error(`Error processing file ${file.name}:`, fileErr);
         }
         setProcessingProgress(Math.round(((i + 1) / fileList.length) * 100));
@@ -292,15 +390,57 @@ export default function App() {
       setEmployees(allNewEmployees);
       setSelectedEmployeeId(null); // Reset view
       setIsProcessing(false);
+
+      // Persist to Firestore
+      if (user) {
+        try {
+          const batch = writeBatch(db);
+          
+          // Delete old records first
+          const oldDocs = await getDocs(collection(db, "employees"));
+          oldDocs.forEach(d => batch.delete(d.ref));
+          
+          // Add new records
+          allNewEmployees.forEach(emp => {
+            const docRef = doc(db, "employees", emp.id);
+            batch.set(docRef, emp);
+          });
+
+          await batch.commit();
+        } catch (error) {
+          handleFirestoreError(error, OperationType.WRITE, "employees");
+        }
+      }
     } catch (error) {
       console.error("Error processing PDFs:", error);
       setIsProcessing(false);
     }
   };
 
+  if (isLoading) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-slate-50 gap-4">
+        <Loader2 className="w-8 h-8 animate-spin text-primary" />
+        <p className="text-slate-500 font-medium">Carregando dados do servidor...</p>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-50/50 p-4 md:p-8 font-sans">
       <div className="max-w-7xl mx-auto space-y-8">
+        {dbError && (
+          <div className="bg-negative/10 border border-negative/20 text-negative p-4 rounded-lg flex items-center gap-3">
+            <AlertCircle className="w-5 h-5" />
+            <div className="flex-1">
+              <p className="font-bold text-sm">Aviso de Sincronização</p>
+              <p className="text-xs opacity-80">{dbError}. O dashboard está exibindo dados locais/cache temporariamente.</p>
+            </div>
+            <Button variant="outline" size="sm" className="bg-white border-negative/20 hover:bg-negative/5" onClick={() => window.location.reload()}>
+              Reconectar
+            </Button>
+          </div>
+        )}
         {/* Header */}
         <header className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div>
@@ -308,6 +448,30 @@ export default function App() {
             <p className="text-slate-500 mt-1">Análise consolidada do período: Março 2026</p>
           </div>
           <div className="flex items-center gap-3">
+            {user ? (
+              <div className="flex items-center gap-3 mr-4 py-2 px-3 bg-white rounded-lg border border-slate-200 shadow-sm">
+                <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center text-primary">
+                  {user.photoURL ? (
+                    <img src={user.photoURL} alt={user.displayName || ""} className="w-full h-full rounded-full" />
+                  ) : (
+                    <UserIcon className="w-4 h-4" />
+                  )}
+                </div>
+                <div className="hidden sm:block">
+                  <p className="text-[10px] text-slate-400 font-medium uppercase">Admin Autenticado</p>
+                  <p className="text-xs font-bold text-slate-700">{user.displayName || user.email}</p>
+                </div>
+                <Button variant="ghost" size="icon-xs" onClick={logout} className="ml-1 text-slate-400 hover:text-negative">
+                  <LogOut className="w-4 h-4" />
+                </Button>
+              </div>
+            ) : (
+              <Button variant="outline" className="gap-2 border-slate-200 hover:bg-slate-100 mr-4" onClick={loginWithGoogle}>
+                <LogIn className="w-4 h-4" />
+                Login Admin
+              </Button>
+            )}
+
             <input 
               type="file" 
               accept=".pdf" 
@@ -316,15 +480,17 @@ export default function App() {
               onChange={handleFileUpload}
               multiple
             />
-            <Button 
-              variant="outline"
-              className="gap-2 border-slate-200 hover:bg-slate-100"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={isProcessing}
-            >
-              {isProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileUp className="w-4 h-4" />}
-              {isProcessing ? `Lendo (${processingProgress}%)` : "Importar PDFs (Até 25)"}
-            </Button>
+            {user && (
+              <Button 
+                variant="outline"
+                className="gap-2 border-slate-200 hover:bg-slate-100"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isProcessing}
+              >
+                {isProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileUp className="w-4 h-4" />}
+                {isProcessing ? `Lendo (${processingProgress}%)` : "Atualizar Dados (PDF)"}
+              </Button>
+            )}
             <Button 
               variant="outline" 
               className="gap-2 border-slate-200 hover:bg-slate-100"
