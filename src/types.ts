@@ -1,3 +1,13 @@
+export interface DailyRecord {
+  date: string;
+  weekday: string;
+  entries: string; // e.g. "08:00 12:00 13:00 17:00"
+  workedHours: string;
+  extraHours: string;
+  debtHours: string;
+  balance: string;
+}
+
 export interface EmployeeTimeData {
   id: string;
   name: string;
@@ -5,6 +15,7 @@ export interface EmployeeTimeData {
   positiveHours: string;
   negativeHours: string;
   currentBalance: string;
+  details?: DailyRecord[];
 }
 
 export function timeToMinutes(timeStr: string): number {

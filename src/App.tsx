@@ -13,14 +13,18 @@ import {
   Copy,
   Check,
   FileUp,
-  Loader2
+  Loader2,
+  ChevronLeft,
+  CalendarDays,
+  History
 } from "lucide-react";
 import { 
   employeeData as initialEmployeeData, 
   timeToMinutes, 
   minutesToTime, 
   EmployeeTimeData,
-  formatTimeWithParens
+  formatTimeWithParens,
+  DailyRecord
 } from "@/types";
 import { cn } from "@/lib/utils";
 import { 
@@ -60,6 +64,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 
 export default function App() {
   const [employees, setEmployees] = useState<EmployeeTimeData[]>(initialEmployeeData);
+  const [selectedEmployeeId, setSelectedEmployeeId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
   const [filterType, setFilterType] = useState<"all" | "positive" | "negative">("all");
   const [sortConfig, setSortConfig] = useState<{ key: keyof EmployeeTimeData; direction: "asc" | "desc" }>({
@@ -68,7 +73,13 @@ export default function App() {
   });
   const [copied, setCopied] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processingProgress, setProcessingProgress] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const selectedEmployee = useMemo(() => 
+    employees.find(e => e.id === selectedEmployeeId),
+    [employees, selectedEmployeeId]
+  );
 
   // Calculations
   const filteredAndSortedData = useMemo(() => {
@@ -203,34 +214,43 @@ export default function App() {
   };
 
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
 
     setIsProcessing(true);
+    setProcessingProgress(0);
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+    
     try {
-      const reader = new FileReader();
-      reader.onload = async (e) => {
-        const base64Data = (e.target?.result as string).split(',')[1];
-        
-        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
-        const response = await ai.models.generateContent({
-          model: "gemini-3-flash-preview",
-          contents: [
-            {
-              inlineData: {
-                mimeType: "application/pdf",
-                data: base64Data
+      const allNewEmployees: EmployeeTimeData[] = [];
+      const fileList = Array.from(files);
+      
+      for (let i = 0; i < fileList.length; i++) {
+        const file = fileList[i];
+        try {
+          const base64Data = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = (e) => resolve((e.target?.result as string).split(',')[1]);
+            reader.onerror = (err) => reject(err);
+            reader.readAsDataURL(file);
+          });
+
+          const response = await ai.models.generateContent({
+            model: "gemini-3-flash-preview",
+            contents: [
+              {
+                inlineData: {
+                  mimeType: "application/pdf",
+                  data: base64Data
+                }
+              },
+              {
+                text: "Analyze this employee time tracking (ponto) PDF. Extract the overall summary AND daily records. Return a JSON object with: id, name, previousBalance, positiveHours, negativeHours, currentBalance, and a details array of objects with keys (date, weekday, entries, workedHours, extraHours, debtHours, balance). Ensure all time values are in HH:MM format (e.g., 10:30 or -0:15). If a value is negative, it must start with a minus sign. Use the full name found in the document."
               }
-            },
-            {
-              text: "Extract the employee bank of hours data from this PDF. Return a JSON array of objects with the following keys: id, name, previousBalance, positiveHours, negativeHours, currentBalance. Ensure all time values are in HH:MM format (e.g., 10:30 or -0:15). If a value is negative, it must start with a minus sign."
-            }
-          ],
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.ARRAY,
-              items: {
+            ],
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: {
                 type: Type.OBJECT,
                 properties: {
                   id: { type: Type.STRING },
@@ -238,21 +258,42 @@ export default function App() {
                   previousBalance: { type: Type.STRING },
                   positiveHours: { type: Type.STRING },
                   negativeHours: { type: Type.STRING },
-                  currentBalance: { type: Type.STRING }
+                  currentBalance: { type: Type.STRING },
+                  details: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        date: { type: Type.STRING },
+                        weekday: { type: Type.STRING },
+                        entries: { type: Type.STRING },
+                        workedHours: { type: Type.STRING },
+                        extraHours: { type: Type.STRING },
+                        debtHours: { type: Type.STRING },
+                        balance: { type: Type.STRING }
+                      },
+                      required: ["date", "weekday", "entries", "workedHours", "extraHours", "debtHours", "balance"]
+                    }
+                  }
                 },
-                required: ["id", "name", "previousBalance", "positiveHours", "negativeHours", "currentBalance"]
+                required: ["id", "name", "previousBalance", "positiveHours", "negativeHours", "currentBalance", "details"]
               }
             }
-          }
-        });
+          });
 
-        const newEmployees = JSON.parse(response.text);
-        setEmployees(newEmployees);
-        setIsProcessing(false);
-      };
-      reader.readAsDataURL(file);
+          const extractedData = JSON.parse(response.text) as EmployeeTimeData;
+          allNewEmployees.push(extractedData);
+        } catch (fileErr) {
+          console.error(`Error processing file ${file.name}:`, fileErr);
+        }
+        setProcessingProgress(Math.round(((i + 1) / fileList.length) * 100));
+      }
+
+      setEmployees(allNewEmployees);
+      setSelectedEmployeeId(null); // Reset view
+      setIsProcessing(false);
     } catch (error) {
-      console.error("Error processing PDF:", error);
+      console.error("Error processing PDFs:", error);
       setIsProcessing(false);
     }
   };
@@ -273,6 +314,7 @@ export default function App() {
               className="hidden" 
               ref={fileInputRef}
               onChange={handleFileUpload}
+              multiple
             />
             <Button 
               variant="outline"
@@ -281,7 +323,7 @@ export default function App() {
               disabled={isProcessing}
             >
               {isProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileUp className="w-4 h-4" />}
-              {isProcessing ? "Processando..." : "Importar PDF"}
+              {isProcessing ? `Lendo (${processingProgress}%)` : "Importar PDFs (Até 25)"}
             </Button>
             <Button 
               variant="outline" 
@@ -301,236 +343,380 @@ export default function App() {
           </div>
         </header>
 
-        {/* Stats Grid */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          <StatCard 
-            title="Total Horas Positivas" 
-            value={stats.totalPos} 
-            icon={<TrendingUp className="text-positive" />} 
-            description="Soma de todos os créditos"
-            trend="+12% vs mês anterior"
-          />
-          <StatCard 
-            title="Total Horas Negativas" 
-            value={stats.totalNeg} 
-            icon={<TrendingDown className="text-negative" />} 
-            description="Soma de todos os débitos"
-            trend="-5% vs mês anterior"
-          />
-          <StatCard 
-            title="Saldo Geral Equipe" 
-            value={stats.netBalance} 
-            icon={<Clock className="text-primary" />} 
-            description="Consolidado final"
-            isBalance
-          />
-          <StatCard 
-            title="Total Colaboradores" 
-            value={stats.totalEmployees.toString()} 
-            icon={<Users className="text-slate-600" />} 
-            description="Base ativa analisada"
-          />
-        </div>
-
-        {/* Charts Section */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <Card className="lg:col-span-2 shadow-sm border-slate-200">
-            <CardHeader>
-              <CardTitle className="text-lg font-semibold flex items-center gap-2">
-                <TrendingUp className="w-5 h-5 text-primary" />
-                Top 10 Saldos Atuais (Horas)
-              </CardTitle>
-              <CardDescription>Visualização dos maiores saldos do período</CardDescription>
-            </CardHeader>
-            <CardContent className="h-[300px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={chartData}>
-                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
-                  <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{fontSize: 12, fill: '#64748b'}} />
-                  <YAxis axisLine={false} tickLine={false} tick={{fontSize: 12, fill: '#64748b'}} />
-                  <Tooltip 
-                    cursor={{fill: '#f8fafc'}}
-                    contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
-                    formatter={(value: number) => [`${value.toFixed(2)}h`, 'Saldo']}
-                  />
-                  <Bar dataKey="balance" radius={[4, 4, 0, 0]}>
-                    {chartData.map((entry, index) => (
-                      <Cell key={`cell-${index}`} fill={entry.balance >= 0 ? '#10b981' : '#ef4444'} />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </CardContent>
-          </Card>
-
-          <Card className="shadow-sm border-slate-200">
-            <CardHeader>
-              <CardTitle className="text-lg font-semibold">Distribuição de Saldos</CardTitle>
-              <CardDescription>Status geral da equipe</CardDescription>
-            </CardHeader>
-            <CardContent className="h-[300px] flex flex-col items-center justify-center">
-              <ResponsiveContainer width="100%" height="80%">
-                <PieChart>
-                  <Pie
-                    data={pieData}
-                    cx="50%"
-                    cy="50%"
-                    innerRadius={60}
-                    outerRadius={80}
-                    paddingAngle={5}
-                    dataKey="value"
-                  >
-                    {pieData.map((entry, index) => (
-                      <Cell key={`cell-${index}`} fill={entry.color} />
-                    ))}
-                  </Pie>
-                  <Tooltip />
-                </PieChart>
-              </ResponsiveContainer>
-              <div className="grid grid-cols-3 gap-4 w-full mt-4">
-                {pieData.map((item) => (
-                  <div key={item.name} className="text-center">
-                    <div className="text-xs text-slate-500 mb-1">{item.name}</div>
-                    <div className="font-bold" style={{ color: item.color }}>{item.value}</div>
-                  </div>
-                ))}
+        {/* Main Content Area */}
+        <AnimatePresence mode="wait">
+          {!selectedEmployeeId ? (
+            <motion.div
+              key="dashboard"
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+              className="space-y-8"
+            >
+              {/* Stats Grid */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                <StatCard 
+                  title="Total Horas Positivas" 
+                  value={stats.totalPos} 
+                  icon={<TrendingUp className="text-positive" />} 
+                  description="Soma de todos os créditos"
+                  trend="+12% vs mês anterior"
+                />
+                <StatCard 
+                  title="Total Horas Negativas" 
+                  value={stats.totalNeg} 
+                  icon={<TrendingDown className="text-negative" />} 
+                  description="Soma de todos os débitos"
+                  trend="-5% vs mês anterior"
+                />
+                <StatCard 
+                  title="Saldo Geral Equipe" 
+                  value={stats.netBalance} 
+                  icon={<Clock className="text-primary" />} 
+                  description="Consolidado final"
+                  isBalance
+                />
+                <StatCard 
+                  title="Total Colaboradores" 
+                  value={stats.totalEmployees.toString()} 
+                  icon={<Users className="text-slate-600" />} 
+                  description="Base ativa analisada"
+                />
               </div>
-            </CardContent>
-          </Card>
-        </div>
 
-        {/* Main Table Section */}
-        <Card className="shadow-sm border-slate-200 overflow-hidden">
-          <CardHeader className="border-b border-slate-100 bg-white">
-            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-              <div>
-                <CardTitle className="text-xl font-bold">Listagem de Colaboradores</CardTitle>
-                <CardDescription>Controle detalhado de horas por funcionário</CardDescription>
-              </div>
-              <div className="flex flex-wrap items-center gap-3">
-                <div className="relative w-full md:w-64">
-                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-                  <Input 
-                    placeholder="Buscar por nome ou ID..." 
-                    className="pl-9 bg-slate-50 border-slate-200 focus:bg-white transition-all"
-                    value={searchTerm}
-                    onChange={(e) => setSearchTerm(e.target.value)}
-                  />
-                </div>
-                <Select value={filterType} onValueChange={(v: any) => setFilterType(v)}>
-                  <SelectTrigger className="w-[160px] bg-slate-50 border-slate-200">
-                    <Filter className="w-4 h-4 mr-2 text-slate-400" />
-                    <SelectValue placeholder="Filtrar por" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">Todos</SelectItem>
-                    <SelectItem value="positive">Saldo Positivo</SelectItem>
-                    <SelectItem value="negative">Saldo Negativo</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
-          </CardHeader>
-          <CardContent className="p-0">
-            <div className="overflow-x-auto">
-              <Table>
-                <TableHeader className="bg-slate-50/50">
-                  <TableRow>
-                    <TableHead className="w-[100px] font-semibold text-slate-900">ID</TableHead>
-                    <TableHead 
-                      className="cursor-pointer hover:bg-slate-100 transition-colors font-semibold text-slate-900"
-                      onClick={() => handleSort("name")}
-                    >
-                      <div className="flex items-center gap-2">
-                        Nome do Colaborador
-                        <ArrowUpDown className="w-3 h-3 text-slate-400" />
-                      </div>
-                    </TableHead>
-                    <TableHead 
-                      className="text-right cursor-pointer hover:bg-slate-100 transition-colors font-semibold text-slate-900"
-                      onClick={() => handleSort("previousBalance")}
-                    >
-                      <div className="flex items-center justify-end gap-2">
-                        Banco Anterior
-                        <ArrowUpDown className="w-3 h-3 text-slate-400" />
-                      </div>
-                    </TableHead>
-                    <TableHead className="text-right font-semibold text-slate-900">Horas Positivas</TableHead>
-                    <TableHead className="text-right font-semibold text-slate-900">Horas Negativas</TableHead>
-                    <TableHead 
-                      className="text-right cursor-pointer hover:bg-slate-100 transition-colors font-semibold text-slate-900"
-                      onClick={() => handleSort("currentBalance")}
-                    >
-                      <div className="flex items-center justify-end gap-2">
-                        Banco Atual
-                        <ArrowUpDown className="w-3 h-3 text-slate-400" />
-                      </div>
-                    </TableHead>
-                    <TableHead className="text-center font-semibold text-slate-900">Status</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  <AnimatePresence mode="popLayout">
-                    {filteredAndSortedData.map((emp) => {
-                      const balanceMin = timeToMinutes(emp.currentBalance);
-                      const isPositive = balanceMin > 0;
-                      const isNegative = balanceMin < 0;
+              {/* Charts Section */}
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <Card className="lg:col-span-2 shadow-sm border-slate-200">
+                  <CardHeader>
+                    <CardTitle className="text-lg font-semibold flex items-center gap-2">
+                      <TrendingUp className="w-5 h-5 text-primary" />
+                      Ranking de Saldos (Top 10)
+                    </CardTitle>
+                    <CardDescription>Visualização dos colaboradores com maiores saldos</CardDescription>
+                  </CardHeader>
+                  <CardContent className="h-[300px]">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={chartData}>
+                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
+                        <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{fontSize: 12, fill: '#64748b'}} />
+                        <YAxis axisLine={false} tickLine={false} tick={{fontSize: 12, fill: '#64748b'}} />
+                        <Tooltip 
+                          cursor={{fill: '#f8fafc'}}
+                          contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
+                          formatter={(value: number) => [`${value.toFixed(2)}h`, 'Saldo']}
+                        />
+                        <Bar dataKey="balance" radius={[4, 4, 0, 0]}>
+                          {chartData.map((entry, index) => (
+                            <Cell key={`cell-${index}`} fill={entry.balance >= 0 ? '#10b981' : '#ef4444'} />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </CardContent>
+                </Card>
 
-                      return (
-                        <motion.tr
-                          key={emp.id}
-                          layout
-                          initial={{ opacity: 0 }}
-                          animate={{ opacity: 1 }}
-                          exit={{ opacity: 0 }}
-                          className="group hover:bg-slate-50/80 transition-colors border-b border-slate-100"
+                <Card className="shadow-sm border-slate-200">
+                  <CardHeader>
+                    <CardTitle className="text-lg font-semibold">Distribuição de Saldos</CardTitle>
+                    <CardDescription>Status geral da equipe</CardDescription>
+                  </CardHeader>
+                  <CardContent className="h-[300px] flex flex-col items-center justify-center">
+                    <ResponsiveContainer width="100%" height="80%">
+                      <PieChart>
+                        <Pie
+                          data={pieData}
+                          cx="50%"
+                          cy="50%"
+                          innerRadius={60}
+                          outerRadius={80}
+                          paddingAngle={5}
+                          dataKey="value"
                         >
-                          <TableCell className="font-mono text-xs text-slate-500">{emp.id}</TableCell>
-                          <TableCell className="font-medium text-slate-900">{emp.name}</TableCell>
-                          <TableCell className="text-right font-mono text-slate-600">
-                            {formatTimeWithParens(emp.previousBalance)}
-                          </TableCell>
-                          <TableCell className="text-right font-mono text-positive font-medium">
-                            {formatTimeWithParens(emp.positiveHours)}
-                          </TableCell>
-                          <TableCell className="text-right font-mono text-negative font-medium">
-                            {formatTimeWithParens(emp.negativeHours)}
-                          </TableCell>
-                          <TableCell className={cn(
-                            "text-right font-mono font-bold text-lg",
-                            isPositive ? "text-positive" : isNegative ? "text-negative" : "text-slate-400"
-                          )}>
-                            {formatTimeWithParens(emp.currentBalance)}
-                          </TableCell>
-                          <TableCell className="text-center">
-                            <Badge className={cn(
-                              "px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wider font-bold border-none",
-                              isPositive ? "bg-emerald-100 text-emerald-700" : 
-                              isNegative ? "bg-rose-100 text-rose-700" : 
-                              "bg-slate-100 text-slate-500"
-                            )}>
-                              {isPositive ? "Crédito" : isNegative ? "Débito" : "Zerado"}
-                            </Badge>
-                          </TableCell>
-                        </motion.tr>
-                      );
-                    })}
-                  </AnimatePresence>
-                  {filteredAndSortedData.length === 0 && (
-                    <TableRow>
-                      <TableCell colSpan={7} className="h-32 text-center text-slate-500">
-                        <div className="flex flex-col items-center gap-2">
-                          <AlertCircle className="w-8 h-8 text-slate-300" />
-                          <p>Nenhum colaborador encontrado com os filtros atuais.</p>
+                          {pieData.map((entry, index) => (
+                            <Cell key={`cell-${index}`} fill={entry.color} />
+                          ))}
+                        </Pie>
+                        <Tooltip />
+                      </PieChart>
+                    </ResponsiveContainer>
+                    <div className="grid grid-cols-3 gap-4 w-full mt-4">
+                      {pieData.map((item) => (
+                        <div key={item.name} className="text-center">
+                          <div className="text-xs text-slate-500 mb-1">{item.name}</div>
+                          <div className="font-bold" style={{ color: item.color }}>{item.value}</div>
                         </div>
-                      </TableCell>
-                    </TableRow>
-                  )}
-                </TableBody>
-              </Table>
-            </div>
-          </CardContent>
-        </Card>
+                      ))}
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+
+              {/* Main Table Section */}
+              <Card className="shadow-sm border-slate-200 overflow-hidden">
+                <CardHeader className="border-b border-slate-100 bg-white">
+                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                    <div>
+                      <CardTitle className="text-xl font-bold">Listagem de Colaboradores</CardTitle>
+                      <CardDescription>Controle detalhado de horas por funcionário</CardDescription>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <div className="relative w-full md:w-64">
+                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                        <Input 
+                          placeholder="Buscar por nome ou ID..." 
+                          className="pl-9 bg-slate-50 border-slate-200 focus:bg-white transition-all"
+                          value={searchTerm}
+                          onChange={(e) => setSearchTerm(e.target.value)}
+                        />
+                      </div>
+                      <Select value={filterType} onValueChange={(v: any) => setFilterType(v)}>
+                        <SelectTrigger className="w-[160px] bg-slate-50 border-slate-200">
+                          <Filter className="w-4 h-4 mr-2 text-slate-400" />
+                          <SelectValue placeholder="Filtrar por" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="all">Todos</SelectItem>
+                          <SelectItem value="positive">Saldo Positivo</SelectItem>
+                          <SelectItem value="negative">Saldo Negativo</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardContent className="p-0">
+                  <div className="overflow-x-auto">
+                    <Table>
+                      <TableHeader className="bg-slate-50/50">
+                        <TableRow>
+                          <TableHead className="w-[100px] font-semibold text-slate-900">ID</TableHead>
+                          <TableHead 
+                            className="cursor-pointer hover:bg-slate-100 transition-colors font-semibold text-slate-900"
+                            onClick={() => handleSort("name")}
+                          >
+                            <div className="flex items-center gap-2">
+                              Nome do Colaborador
+                              <ArrowUpDown className="w-3 h-3 text-slate-400" />
+                            </div>
+                          </TableHead>
+                          <TableHead 
+                            className="text-right cursor-pointer hover:bg-slate-100 transition-colors font-semibold text-slate-900"
+                            onClick={() => handleSort("previousBalance")}
+                          >
+                            <div className="flex items-center justify-end gap-2">
+                              Banco Anterior
+                              <ArrowUpDown className="w-3 h-3 text-slate-400" />
+                            </div>
+                          </TableHead>
+                          <TableHead className="text-right font-semibold text-slate-900">Horas Positivas</TableHead>
+                          <TableHead className="text-right font-semibold text-slate-900">Horas Negativas</TableHead>
+                          <TableHead 
+                            className="text-right cursor-pointer hover:bg-slate-100 transition-colors font-semibold text-slate-900"
+                            onClick={() => handleSort("currentBalance")}
+                          >
+                            <div className="flex items-center justify-end gap-2">
+                              Banco Atual
+                              <ArrowUpDown className="w-3 h-3 text-slate-400" />
+                            </div>
+                          </TableHead>
+                          <TableHead className="text-center font-semibold text-slate-900">Ação</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        <AnimatePresence mode="popLayout">
+                          {filteredAndSortedData.map((emp) => {
+                            const balanceMin = timeToMinutes(emp.currentBalance);
+                            const isPositive = balanceMin > 0;
+                            const isNegative = balanceMin < 0;
+
+                            return (
+                              <motion.tr
+                                key={emp.id}
+                                layout
+                                initial={{ opacity: 0 }}
+                                animate={{ opacity: 1 }}
+                                exit={{ opacity: 0 }}
+                                onClick={() => emp.details && setSelectedEmployeeId(emp.id)}
+                                className={cn(
+                                  "group hover:bg-slate-50/80 transition-colors border-b border-slate-100",
+                                  emp.details && "cursor-pointer"
+                                )}
+                              >
+                                <TableCell className="font-mono text-xs text-slate-500">{emp.id}</TableCell>
+                                <TableCell className="font-medium text-slate-900">{emp.name}</TableCell>
+                                <TableCell className="text-right font-mono text-slate-600">
+                                  {formatTimeWithParens(emp.previousBalance)}
+                                </TableCell>
+                                <TableCell className="text-right font-mono text-positive font-medium">
+                                  {formatTimeWithParens(emp.positiveHours)}
+                                </TableCell>
+                                <TableCell className="text-right font-mono text-negative font-medium">
+                                  {formatTimeWithParens(emp.negativeHours)}
+                                </TableCell>
+                                <TableCell className={cn(
+                                  "text-right font-mono font-bold text-lg",
+                                  isPositive ? "text-positive" : isNegative ? "text-negative" : "text-slate-400"
+                                )}>
+                                  {formatTimeWithParens(emp.currentBalance)}
+                                </TableCell>
+                                <TableCell className="text-center">
+                                  {emp.details ? (
+                                    <Button variant="ghost" size="sm" className="h-7 text-xs gap-1">
+                                      <History className="w-3 h-3" />
+                                      Analisar
+                                    </Button>
+                                  ) : (
+                                    <Badge className={cn(
+                                      "px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wider font-bold border-none",
+                                      isPositive ? "bg-emerald-100 text-emerald-700" : 
+                                      isNegative ? "bg-rose-100 text-rose-700" : 
+                                      "bg-slate-100 text-slate-500"
+                                    )}>
+                                      {isPositive ? "Crédito" : isNegative ? "Débito" : "Zerado"}
+                                    </Badge>
+                                  )}
+                                </TableCell>
+                              </motion.tr>
+                            );
+                          })}
+                        </AnimatePresence>
+                        {filteredAndSortedData.length === 0 && (
+                          <TableRow>
+                            <TableCell colSpan={7} className="h-32 text-center text-slate-500">
+                              <div className="flex flex-col items-center gap-2">
+                                <AlertCircle className="w-8 h-8 text-slate-300" />
+                                <p>Nenhum colaborador encontrado com os filtros atuais.</p>
+                              </div>
+                            </TableCell>
+                          </TableRow>
+                        )}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </CardContent>
+              </Card>
+            </motion.div>
+          ) : (
+            <motion.div
+              key="details"
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: 20 }}
+              className="space-y-6"
+            >
+              <Button 
+                variant="ghost" 
+                onClick={() => setSelectedEmployeeId(null)}
+                className="gap-2 -ml-2 hover:bg-slate-100"
+              >
+                <ChevronLeft className="w-4 h-4" />
+                Voltar ao Dashboard
+              </Button>
+
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <Card className="lg:col-span-1 shadow-sm border-slate-200">
+                  <CardHeader>
+                    <div className="flex items-center gap-3">
+                      <div className="w-12 h-12 rounded-full bg-primary/10 flex items-center justify-center text-primary">
+                        <Users className="w-6 h-6" />
+                      </div>
+                      <div>
+                        <CardTitle className="text-xl font-bold">{selectedEmployee?.name}</CardTitle>
+                        <CardDescription>ID: {selectedEmployee?.id}</CardDescription>
+                      </div>
+                    </div>
+                  </CardHeader>
+                  <CardContent className="space-y-4">
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="p-3 bg-slate-50 rounded-lg">
+                        <div className="text-xs text-slate-500 mb-1">Banco Anterior</div>
+                        <div className="font-mono font-bold text-slate-700">
+                          {formatTimeWithParens(selectedEmployee?.previousBalance || "0:00")}
+                        </div>
+                      </div>
+                      <div className="p-3 bg-slate-50 rounded-lg">
+                        <div className="text-xs text-slate-500 mb-1">Banco Atual</div>
+                        <div className={cn(
+                          "font-mono font-bold text-lg",
+                          timeToMinutes(selectedEmployee?.currentBalance || "0:00") >= 0 ? "text-positive" : "text-negative"
+                        )}>
+                          {formatTimeWithParens(selectedEmployee?.currentBalance || "0:00")}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="space-y-2 pt-2">
+                      <div className="flex justify-between text-sm">
+                        <span className="text-slate-500">Total Positivas</span>
+                        <span className="text-positive font-mono font-medium">
+                          {formatTimeWithParens(selectedEmployee?.positiveHours || "0:00")}
+                        </span>
+                      </div>
+                      <div className="flex justify-between text-sm">
+                        <span className="text-slate-500">Total Negativas</span>
+                        <span className="text-negative font-mono font-medium">
+                          {formatTimeWithParens(selectedEmployee?.negativeHours || "0:00")}
+                        </span>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card className="lg:col-span-2 shadow-sm border-slate-200">
+                  <CardHeader>
+                    <CardTitle className="text-lg font-semibold flex items-center gap-2">
+                      <CalendarDays className="w-5 h-5 text-primary" />
+                      Detalhamento do Ponto (Dário)
+                    </CardTitle>
+                    <CardDescription>Análise diária de entradas, saídas e saldos</CardDescription>
+                  </CardHeader>
+                  <CardContent className="p-0">
+                    <div className="overflow-x-auto max-h-[400px] overflow-y-auto">
+                      <Table>
+                        <TableHeader className="bg-slate-50/50 sticky top-0 z-10">
+                          <TableRow>
+                            <TableHead>Data</TableHead>
+                            <TableHead>Dia</TableHead>
+                            <TableHead>Registros</TableHead>
+                            <TableHead className="text-right">Horas Trab.</TableHead>
+                            <TableHead className="text-right">Saldo Dia</TableHead>
+                          </TableRow>
+                        </TableHeader>
+                        <TableBody>
+                          {selectedEmployee?.details?.map((day, idx) => {
+                            const dayBalanceMin = timeToMinutes(day.balance);
+                            return (
+                              <TableRow key={idx}>
+                                <TableCell className="py-2 text-xs font-medium">{day.date}</TableCell>
+                                <TableCell className="py-2 text-xs text-slate-500">{day.weekday}</TableCell>
+                                <TableCell className="py-2">
+                                  <div className="flex flex-wrap gap-1">
+                                    {day.entries.split(' ').map((t, i) => (
+                                      <span key={i} className="px-1.5 py-0.5 bg-slate-100 rounded text-[10px] font-mono">
+                                        {t}
+                                      </span>
+                                    ))}
+                                  </div>
+                                </TableCell>
+                                <TableCell className="py-2 text-right font-mono text-xs text-slate-600">
+                                  {day.workedHours}
+                                </TableCell>
+                                <TableCell className={cn(
+                                  "py-2 text-right font-mono text-xs font-bold",
+                                  dayBalanceMin > 0 ? "text-positive" : dayBalanceMin < 0 ? "text-negative" : "text-slate-400"
+                                )}>
+                                  {formatTimeWithParens(day.balance)}
+                                </TableCell>
+                              </TableRow>
+                            )
+                          })}
+                        </TableBody>
+                      </Table>
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
     </div>
   );
