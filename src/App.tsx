@@ -64,7 +64,7 @@ import {
 } from "recharts";
 import { motion, AnimatePresence } from "motion/react";
 import * as XLSX from "xlsx";
-import { GoogleGenAI, Type } from "@google/genai";
+import { newData } from "./data_update";
 import { db, auth, loginWithGoogle, logout } from "@/lib/firebase";
 import { onAuthStateChanged, User } from "firebase/auth";
 import { 
@@ -132,7 +132,6 @@ export default function App() {
   const [viewMode, setViewMode] = useState<"current" | "history">("current");
   const [selectedHistoryId, setSelectedHistoryId] = useState<string | null>(null);
   const [user, setUser] = useState<User | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
   const [dbError, setDbError] = useState<string | null>(null);
   const [selectedEmployeeId, setSelectedEmployeeId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
@@ -144,6 +143,7 @@ export default function App() {
   const [copied, setCopied] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [processingProgress, setProcessingProgress] = useState(0);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Sync with Firestore
@@ -156,21 +156,21 @@ export default function App() {
     
     // Initial fetch and real-time listener combined
     const unsubscribeSnapshot = onSnapshot(q, (snapshot) => {
-      if (snapshot.empty) {
-        console.log("No employees found in Firestore, using default data.");
-      } else {
-        const data = snapshot.docs.map(doc => ({
-          ...doc.data(),
-          details: (doc.data() as any).details || []
-        })) as EmployeeTimeData[];
-        setEmployees(data);
+      if (!snapshot.empty) {
+        const employeeMap = new Map<string, EmployeeTimeData>();
+        snapshot.docs.forEach(doc => {
+          const emp = {
+            ...doc.data(),
+            details: (doc.data() as any).details || []
+          } as EmployeeTimeData;
+          employeeMap.set(emp.id, emp);
+        });
+        setEmployees(Array.from(employeeMap.values()));
       }
-      setIsLoading(false);
       setDbError(null);
     }, (error) => {
       console.error("Firestore sync error:", error);
       setDbError("Erro de conexão com o servidor. Verifique sua permissão.");
-      setIsLoading(false);
     });
 
     return () => {
@@ -344,14 +344,17 @@ export default function App() {
 
     setIsProcessing(true);
     setProcessingProgress(0);
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+    setDbError(null);
+    
+    // Usando a nova chave fornecida para evitar problemas de cota
+    const apiKey = "AIzaSyCcVlHnUgqm-mzfb38Nwaze07fuAb7VtOg";
     
     try {
-      const allNewEmployees: EmployeeTimeData[] = [];
+      const employeeMap = new Map<string, EmployeeTimeData>();
       const fileList = Array.from(files) as File[];
+      let completedCount = 0;
       
-      for (let i = 0; i < fileList.length; i++) {
-        const file = fileList[i];
+      const results = await Promise.all(fileList.map(async (file) => {
         try {
           const base64Data = await new Promise<string>((resolve, reject) => {
             const reader = new FileReader();
@@ -360,67 +363,96 @@ export default function App() {
             reader.readAsDataURL(file);
           });
 
-          const response = await ai.models.generateContent({
-            model: "gemini-3-flash-preview",
-            contents: [
-              {
-                inlineData: {
-                  mimeType: "application/pdf",
-                  data: base64Data
-                }
-              },
-              {
-                text: "Analyze this employee time tracking (ponto) PDF. Extract the overall summary AND daily records. Return a JSON object with: id, name, previousBalance, positiveHours, negativeHours, currentBalance, and a details array of objects with keys (date, weekday, entries, workedHours, extraHours, debtHours, balance). Ensure all time values are in HH:MM format (e.g., 10:30 or -0:15). If a value is negative, it must start with a minus sign. Use the full name found in the document."
-              }
-            ],
-            config: {
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  id: { type: Type.STRING },
-                  name: { type: Type.STRING },
-                  previousBalance: { type: Type.STRING },
-                  positiveHours: { type: Type.STRING },
-                  negativeHours: { type: Type.STRING },
-                  currentBalance: { type: Type.STRING },
-                  details: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        date: { type: Type.STRING },
-                        weekday: { type: Type.STRING },
-                        entries: { type: Type.STRING },
-                        workedHours: { type: Type.STRING },
-                        extraHours: { type: Type.STRING },
-                        debtHours: { type: Type.STRING },
-                        balance: { type: Type.STRING }
-                      },
-                      required: ["date", "weekday", "entries", "workedHours", "extraHours", "debtHours", "balance"]
+          // Chamada direta via fetch para evitar erros de inicialização do SDK em browser.
+          // Usando gemini-1.5-flash, um alias estável. Adicionando log detalhado para 404s.
+          const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+          
+          const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{
+                parts: [
+                  {
+                    inlineData: {
+                      mimeType: "application/pdf",
+                      data: base64Data
                     }
+                  },
+                  {
+                    text: "Analyze this employee time tracking (ponto) PDF. Extract summary and daily records. Return JSON matching: {id, name, previousBalance, positiveHours, negativeHours, currentBalance, details: [{date, weekday, entries, workedHours, extraHours, debtHours, balance}]}. Use HH:MM format."
                   }
-                },
-                required: ["id", "name", "previousBalance", "positiveHours", "negativeHours", "currentBalance", "details"]
+                ]
+              }],
+              generationConfig: {
+                responseMimeType: "application/json"
               }
-            }
+            })
           });
 
-          const extractedData = JSON.parse(response.text) as EmployeeTimeData;
-          allNewEmployees.push(extractedData);
+          if (!response.ok) {
+            const errData = await response.json().catch(() => ({}));
+            console.error("API error details:", errData);
+            throw new Error(errData?.error?.message || response.statusText);
+          }
+
+          const result = await response.json();
+          const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (!text) throw new Error("Resposta vazia da API");
+          
+          const extractedData = JSON.parse(text) as EmployeeTimeData;
+          
+          completedCount++;
+          setProcessingProgress(Math.round((completedCount / fileList.length) * 100));
+          
+          return extractedData;
         } catch (fileErr: any) {
           console.error(`Error processing file ${file.name}:`, fileErr);
+          completedCount++;
+          setProcessingProgress(Math.round((completedCount / fileList.length) * 100));
+          
+          if (fileErr.message?.includes('429')) {
+            setDbError(`Cota excedida na API ao ler ${file.name}.`);
+          } else {
+            setDbError(`Erro no arquivo ${file.name}: ${fileErr.message}`);
+          }
+          return null;
         }
-        setProcessingProgress(Math.round(((i + 1) / fileList.length) * 100));
-      }
+      }));
 
-      setEmployees(allNewEmployees);
-      setPreparedData(allNewEmployees);
-      setSelectedEmployeeId(null); // Reset view
+      results.forEach(data => {
+        if (data && data.id) {
+          employeeMap.set(data.id, data);
+        }
+      });
+
+      const allNewEmployees = Array.from(employeeMap.values());
+      if (allNewEmployees.length > 0) {
+        setEmployees(allNewEmployees);
+        setPreparedData(allNewEmployees);
+      }
+      setSelectedEmployeeId(null);
       setIsProcessing(false);
-    } catch (error) {
-      console.error("Error processing PDFs:", error);
+    } catch (error: any) {
+      console.error("General upload error:", error);
+      setDbError("Erro no processamento dos arquivos: " + error.message);
       setIsProcessing(false);
+    }
+  };
+
+  const handleLogin = async () => {
+    try {
+      setDbError(null);
+      await loginWithGoogle();
+    } catch (error: any) {
+      console.error("Login Error:", error);
+      if (error.code === 'auth/popup-closed-by-user') {
+        setDbError("Login cancelado pelo usuário.");
+      } else if (error.code === 'auth/unauthorized-domain') {
+        setDbError("Este domínio não está autorizado no Firebase. Adicione " + window.location.hostname + " aos domínios autorizados.");
+      } else {
+        setDbError("Falha no login: " + error.message);
+      }
     }
   };
 
@@ -428,77 +460,114 @@ export default function App() {
     if (!user || !preparedData) return;
     try {
       setIsProcessing(true);
-      const batch = writeBatch(db);
+      setDbError(null);
       
-      // Delete old records first
+      // Get all current docs to delete
       const oldDocs = await getDocs(collection(db, "employees"));
-      oldDocs.forEach(d => batch.delete(d.ref));
       
+      // Use batches for safer writing (max 500 ops per batch)
+      let batch = writeBatch(db);
+      let operationCount = 0;
+
+      // Delete old records
+      for (const docSnap of oldDocs.docs) {
+        batch.delete(docSnap.ref);
+        operationCount++;
+        if (operationCount >= 400) {
+          await batch.commit();
+          batch = writeBatch(db);
+          operationCount = 0;
+        }
+      }
+
       // Add new records
-      preparedData.forEach(emp => {
+      for (const emp of preparedData) {
         const docRef = doc(db, "employees", emp.id);
         batch.set(docRef, emp);
-      });
+        operationCount++;
+        if (operationCount >= 400) {
+          await batch.commit();
+          batch = writeBatch(db);
+          operationCount = 0;
+        }
+      }
 
-      await batch.commit();
+      if (operationCount > 0) {
+        await batch.commit();
+      }
+
       setPreparedData(null);
+      setSuccessMessage("Dashboard principal atualizado com sucesso!");
+      setTimeout(() => setSuccessMessage(null), 5000);
       setIsProcessing(false);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, "employees");
+    } catch (error: any) {
+      console.error("Save Current Error:", error);
+      setDbError("Erro ao salvar no dashboard: " + (error.message || "Permissão negada"));
       setIsProcessing(false);
     }
   };
 
-  const handleSaveToHistory = async (monthName: string) => {
+  const handleSaveToHistory = async (monthLabel: string) => {
     if (!user || !preparedData) return;
     try {
       setIsProcessing(true);
-      // Generate ID from name or date
-      const monthId = new Date().toISOString().slice(0, 7); // Default to current month
+      setDbError(null);
+      
+      // Generating a unique ID for the history record (YYYY-MM-Label)
+      const now = new Date();
+      const monthId = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${monthLabel.replace(/\s+/g, '_')}`;
       
       await setDoc(doc(db, "monthly_history", monthId), {
         id: monthId,
-        monthName: monthName,
+        monthName: monthLabel,
         data: preparedData,
         createdAt: new Date()
       });
 
       setPreparedData(null);
-      setIsProcessing(false);
+      setSuccessMessage(`Histórico de "${monthLabel}" salvo com sucesso!`);
+      setTimeout(() => setSuccessMessage(null), 5000);
+      
       setViewMode("history");
       setSelectedHistoryId(monthId);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, "monthly_history");
+      setIsProcessing(false);
+    } catch (error: any) {
+      console.error("Save History Error:", error);
+      setDbError("Erro ao salvar histórico: " + (error.message || "Permissão negada"));
       setIsProcessing(false);
     }
   };
 
-  if (isLoading) {
-    return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-slate-50 gap-4">
-        <Loader2 className="w-8 h-8 animate-spin text-primary" />
-        <p className="text-slate-500 font-medium">Carregando dados do servidor...</p>
-      </div>
-    );
-  }
-
   return (
     <div className="min-h-screen bg-slate-50/50 p-4 md:p-8 font-sans">
       <div className="max-w-7xl mx-auto space-y-8">
+        {successMessage && (
+          <motion.div 
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="bg-emerald-50 border border-emerald-200 text-emerald-700 p-4 rounded-lg flex items-center gap-3 shadow-sm"
+          >
+            <Check className="w-5 h-5 text-emerald-500" />
+            <p className="font-medium text-sm">{successMessage}</p>
+          </motion.div>
+        )}
+
         {dbError && (
-          <div className="bg-negative/10 border border-negative/20 text-negative p-4 rounded-lg flex items-center gap-3">
-            <AlertCircle className="w-5 h-5" />
-            <div className="flex-1">
-              <p className="font-bold text-sm">Aviso de Sincronização</p>
-              <p className="text-xs opacity-80">{dbError}. O dashboard está exibindo dados locais/cache temporariamente.</p>
+          <div className="bg-negative/10 border border-negative/20 text-negative p-4 rounded-lg flex flex-col md:flex-row md:items-center gap-3">
+            <div className="flex items-center gap-3 flex-1">
+              <AlertCircle className="w-5 h-5" />
+              <div className="flex-1">
+                <p className="font-bold text-sm">Aviso de Sistema</p>
+                <p className="text-xs opacity-80">{dbError}</p>
+              </div>
             </div>
             <Button variant="outline" size="sm" className="bg-white border-negative/20 hover:bg-negative/5" onClick={() => window.location.reload()}>
-              Reconectar
+              Reconectar / Recarregar
             </Button>
           </div>
         )}
 
-        {preparedData && user && (
+        {preparedData && (
           <motion.div 
             initial={{ opacity: 0, y: -10 }}
             animate={{ opacity: 1, y: 0 }}
@@ -510,27 +579,52 @@ export default function App() {
               </div>
               <div>
                 <p className="font-bold text-slate-800">Novos dados carregados!</p>
-                <p className="text-xs text-slate-500">Deseja salvar estes dados no Dashboard Atual ou em um mês específico?</p>
+                {user ? (
+                  <p className="text-xs text-slate-500">Deseja salvar estes dados no Dashboard Atual ou em um mês específico?</p>
+                ) : (
+                  <p className="text-xs text-rose-500 font-bold">Faça login como Admin para salvar estes dados.</p>
+                )}
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <Button size="sm" onClick={handleSaveToCurrent} disabled={isProcessing}>
-                {isProcessing ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
-                Salvar no Atual
-              </Button>
-              <Select onValueChange={(val) => handleSaveToHistory(val)}>
-                <SelectTrigger className="w-[180px] bg-white h-9 text-xs">
-                  <History className="w-3 h-3 mr-2" />
-                  <SelectValue placeholder="Salvar no Histórico" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="Janeiro 2026">Janeiro 2026</SelectItem>
-                  <SelectItem value="Fevereiro 2026">Fevereiro 2026</SelectItem>
-                  <SelectItem value="Março 2026">Março 2026</SelectItem>
-                  <SelectItem value="Abril 2026">Abril 2026</SelectItem>
-                  <SelectItem value="Maio 2026">Maio 2026</SelectItem>
-                </SelectContent>
-              </Select>
+              {user ? (
+                <>
+                  <Button 
+                    size="sm" 
+                    className="bg-primary hover:bg-primary/90" 
+                    onClick={handleSaveToCurrent} 
+                    disabled={isProcessing}
+                  >
+                    {isProcessing ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <Check className="w-4 h-4 mr-2" />}
+                    Salvar no Atual
+                  </Button>
+                  <Select onValueChange={(val: string) => handleSaveToHistory(val)}>
+                    <SelectTrigger className="w-[180px] bg-white h-9 text-xs">
+                      <History className="w-3 h-3 mr-2" />
+                      <SelectValue placeholder="Salvar no Histórico" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {(() => {
+                        const months = [
+                          "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", 
+                          "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"
+                        ];
+                        const currentYear = new Date().getFullYear();
+                        return months.map(m => (
+                          <SelectItem key={`${m}-${currentYear}`} value={`${m} ${currentYear}`}>
+                            {m} {currentYear}
+                          </SelectItem>
+                        ));
+                      })()}
+                    </SelectContent>
+                  </Select>
+                </>
+              ) : (
+                <Button size="sm" variant="outline" onClick={handleLogin}>
+                  <LogIn className="w-4 h-4 mr-2" />
+                  Login para Salvar
+                </Button>
+              )}
               <Button variant="ghost" size="sm" onClick={() => setPreparedData(null)} disabled={isProcessing}>
                 Descartar
               </Button>
@@ -608,7 +702,7 @@ export default function App() {
                 </Button>
               </div>
             ) : (
-              <Button variant="outline" className="gap-2 border-slate-200 hover:bg-slate-100 mr-4" onClick={loginWithGoogle}>
+              <Button variant="outline" className="gap-2 border-slate-200 hover:bg-slate-100 mr-4" onClick={handleLogin}>
                 <LogIn className="w-4 h-4" />
                 Login Admin
               </Button>
@@ -622,6 +716,19 @@ export default function App() {
               onChange={handleFileUpload}
               multiple
             />
+            {user && (
+              <Button 
+                variant="outline"
+                className="gap-2 border-slate-200 hover:bg-slate-100"
+                onClick={() => {
+                  setPreparedData(newData);
+                  setSuccessMessage("Dados da nova tabela carregados. Clique em 'Salvar no Atual'!");
+                }}
+              >
+                <FileUp className="w-4 h-4" />
+                Importar Tabela
+              </Button>
+            )}
             {user && (
               <Button 
                 variant="outline"
